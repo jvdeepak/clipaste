@@ -4,11 +4,21 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  codex-hook:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.9'
+      - run: python -m unittest discover -s integrations/codex -v
+
   test:
     runs-on: ${{ matrix.os }}
     strategy:

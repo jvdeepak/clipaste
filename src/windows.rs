@@ -114,6 +114,14 @@ fn write_path_to_clipboard(path: &str, png_data: &[u8]) {
 }
 
 fn normalize(latest: &common::LatestImage, server_only: bool) {
+    // In bridge-only mode every event belongs to another app. Invalidate the
+    // previous screenshot before reading, so copying text (or a failed capture)
+    // cannot silently serve an unrelated old image to the next remote prompt.
+    if server_only {
+        if let Ok(mut guard) = latest.lock() {
+            *guard = None;
+        }
+    }
     if !is_image_only_clipboard() {
         return;
     }
@@ -240,6 +248,11 @@ pub fn run(latest: common::LatestImage, server_only: bool) {
         }
 
         common::log("clipboard listener registered (event-driven, no polling)");
+
+        // Include a screenshot copied before login/startup without requiring a recopy.
+        if server_only {
+            normalize(LATEST.get().expect("clipboard state initialized"), true);
+        }
 
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, ptr::null_mut() as HWND, 0, 0) > 0 {

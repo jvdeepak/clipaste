@@ -2,6 +2,11 @@
 
 Fix screenshot paste in terminal AI tools — locally, over SSH, and in WSL2.
 
+**This fork adds seamless stock-Codex image input over SSH:** copy a screenshot,
+include `@clipboard` in your prompt, and submit. A Codex hook fetches the image
+and asks Codex to inspect it. See [setup and usage](integrations/codex/README.md).
+The upstream manual `clipaste-paste` instructions below remain a fallback.
+
 **[hqhq1025.github.io/clipaste](https://hqhq1025.github.io/clipaste/)** · [AGENTS.md](AGENTS.md) · [Issues](https://github.com/hqhq1025/clipaste/issues)
 
 **clipaste** is a lightweight Rust clipboard daemon for developers who use terminal-based AI coding tools like Claude Code, Codex CLI, and Cursor. It fixes local screenshot paste on macOS and Windows, bridges their clipboards to remote servers over SSH, and connects Windows to WSL2. Graphical Linux hosts can also serve clipboard PNG images over SSH using the read-only backend described below.
