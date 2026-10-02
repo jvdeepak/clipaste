@@ -44,10 +44,24 @@ Use a build of this fork: the upstream v2.5.0 Windows release does not support
 server-only mode. The fork also clears stale screenshots when the clipboard is
 changed to text, and captures an image already on the clipboard at startup.
 
+From this repository on Windows, one command installs the remote hook, creates
+the Windows Startup shortcut, starts the bridge, and checks the tunnel:
+
+```powershell
+.\integrations\codex\setup-windows.ps1 -HostAlias stssgoffmgt01-rh8 -BinaryPath .\target\release\clipaste.exe
+```
+
+Alternatively, point `-BinaryPath` to `clipaste.exe` downloaded from this fork's
+`clipaste-windows` Check workflow artifact. `-RemotePython python3.11` is the
+default; specify another Python 3.9+ executable if needed. After installation,
+review the hook once in Codex `/hooks`.
+
+For manual setup:
+
 Place `clipaste.exe` and `windows-bridge.ps1` in `%LOCALAPPDATA%\clipaste`, then run:
 
 ```powershell
-powershell.exe -NoProfile -WindowStyle Hidden -File "$env:LOCALAPPDATA\clipaste\windows-bridge.ps1" -HostAlias stssgoffmgt01-rh8
+pwsh.exe -NoProfile -WindowStyle Hidden -File "$env:LOCALAPPDATA\clipaste\windows-bridge.ps1" -HostAlias stssgoffmgt01-rh8
 ```
 
 Create a Windows Startup shortcut with the same command for automatic login
@@ -87,3 +101,22 @@ empty/error/oversized responses, PNG integrity, timeouts, loopback-only URLs,
 installer idempotency, existing-hook preservation, and the blocking exit code.
 Also verify a real Windows clipboard image through the tunnel and a real Codex
 turn; unit tests do not establish end-to-end image understanding.
+
+The Windows smoke test temporarily stages a synthetic screenshot, restores the
+original clipboard afterwards, and checks that copying text invalidates it:
+
+```powershell
+pwsh -STA -NoProfile -File .\integrations\codex\test-windows.ps1 -HostAlias stssgoffmgt01-rh8
+```
+
+Add `-RunCodex` to run a read-only Codex turn that identifies a random code and
+colored shape. If Node/Codex is installed through nvm and unavailable to
+non-interactive SSH commands, also set `-RemoteCodexDirectory` to its remote
+`bin` directory. This test uses Codex's documented one-invocation hook-trust
+bypass for the reviewed test hook; it does not persist trust or bypass the
+read-only sandbox. Use it only after reviewing all enabled hooks on that host.
+
+Verified on Windows -> `stssgoffmgt01-rh8` (RHEL 8, Python 3.11, stock Codex
+0.160.0): the model correctly identified the random code and orange circle;
+text copying cleared the staged screenshot; and terminating only the managed
+SSH tunnel caused the supervisor to reconnect and restore the endpoint.
