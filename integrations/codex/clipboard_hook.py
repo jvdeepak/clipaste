@@ -9,7 +9,10 @@ import os
 from pathlib import Path
 import re
 import shlex
+import socket
+import stat
 import struct
+import subprocess
 import sys
 import tempfile
 import time
@@ -22,6 +25,7 @@ MARKER = re.compile(r"(?<![\w@/])@clipboard(?=$|[\s!?;:)\]]|[.,](?=\s|$))")
 MAX_IMAGE = 32 * 1024 * 1024
 MAX_INPUT = 8 * 1024 * 1024
 TIMEOUT = 8
+RETENTION = 24 * 60 * 60
 DEFAULT_URL = "http://127.0.0.1:18340"
 
 
@@ -80,6 +84,128 @@ def fetch_image(url):
     return image
 
 
+class UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, path):
+        super().__init__("localhost", timeout=TIMEOUT)
+        self.path = str(path)
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.path)
+
+
+def private_directory(path, create=False):
+    path = Path(path)
+    if create:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise ClipboardError("Clipboard directory must be a real directory owned by your account.")
+    if create:
+        path.chmod(0o700)
+    elif info.st_mode & 0o077:
+        raise ClipboardError("Clipboard socket directory must have mode 0700.")
+    return path
+
+
+def socket_path(value):
+    path = Path(value)
+    if not path.is_absolute() or path.name != "bridge.sock" or len(os.fsencode(path)) >= 100:
+        raise ClipboardError("Invalid private clipboard socket path.")
+    private_directory(path.parent)
+    return path
+
+
+def prepare_socket(codex_home):
+    directory = private_directory(codex_home / "clipaste", create=True)
+    path = socket_path(str(directory / "bridge.sock"))
+    if path.exists() or path.is_symlink():
+        info = path.lstat()
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+            raise ClipboardError("Refusing to replace an unexpected clipboard socket entry.")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+            probe.settimeout(1)
+            try:
+                probe.connect(str(path))
+            except ConnectionRefusedError:
+                path.unlink()
+            else:
+                raise ClipboardError("A clipboard bridge already owns this private socket.")
+    return str(path)
+
+
+def fetch_private_image(value):
+    path = socket_path(value)
+    connection = UnixHTTPConnection(path)
+    try:
+        info = path.lstat()
+        if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
+            raise ClipboardError("Clipboard endpoint is not a socket owned by your account.")
+        connection.request("GET", "/clipboard/image")
+        response = connection.getresponse()
+        if response.status == 204:
+            raise ClipboardError("No image on the clipboard. Copy a screenshot and submit again.")
+        if response.status != 200:
+            raise ClipboardError("The private clipboard endpoint did not return an image.")
+        length = response.getheader("Content-Length")
+        if length and (not length.isdecimal() or int(length) > MAX_IMAGE):
+            raise ClipboardError("Invalid clipboard image length or image exceeds 32 MiB.")
+        image = response.read(MAX_IMAGE + 1)
+        if length and len(image) != int(length):
+            raise ClipboardError("Clipboard transfer was incomplete.")
+    except (OSError, http.client.HTTPException) as exc:
+        raise BridgeUnavailable("Cannot reach clipaste. Start Clipaste from the Windows Start menu.") from exc
+    finally:
+        connection.close()
+    validate_png(image)
+    return image
+
+
+def cleanup_images(directory, now=None):
+    directory = Path(directory)
+    if not directory.exists():
+        return 0
+    private_directory(directory)
+    cutoff = (time.time() if now is None else now) - RETENTION
+    removed = 0
+    for path in directory.iterdir():
+        if not re.fullmatch(r"clipboard-[A-Za-z0-9_-]+\.png", path.name):
+            continue
+        info = path.lstat()
+        if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_mtime <= cutoff:
+            path.unlink()
+            removed += 1
+    return removed
+
+
+def merge_cleanup_cron(existing, command):
+    marker = "# clipaste-image-cleanup-24h"
+    lines = [line for line in existing.splitlines() if not line.endswith(marker)]
+    # crontab treats percent specially even inside shell quotes.
+    lines.append("* * * * * " + command.replace("%", r"\%") + " " + marker)
+    return "\n".join(lines) + "\n"
+
+
+def install_cleanup_timer(script):
+    uv = Path.home() / ".local" / "bin" / "uv"
+    if not uv.is_file():
+        raise ClipboardError("uv is required to schedule private image cleanup.")
+    old = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=10)
+    if old.returncode not in (0, 1) or (old.returncode == 1 and old.stdout):
+        raise ClipboardError("Cannot read the current user's crontab; it was left unchanged.")
+    if old.returncode == 1 and old.stderr and "no crontab" not in old.stderr.lower():
+        raise ClipboardError("Cannot read the current user's crontab: " + old.stderr.strip())
+    command = shlex.join([str(uv), "run", "--offline", "--no-project", "--python", "3.11", str(script), "cleanup"])
+    new = merge_cleanup_cron(old.stdout, command)
+    if new != old.stdout:
+        if old.stdout:
+            atomic_write(script.with_name("crontab-before-cleanup.bak"), old.stdout.encode())
+        result = subprocess.run(["crontab", "-"], input=new, capture_output=True, text=True, timeout=10)
+        if result.returncode:
+            raise ClipboardError("Cannot install clipboard cleanup timer: " + result.stderr.strip())
+
+
 def validate_png(data):
     if len(data) > MAX_IMAGE:
         raise ClipboardError("Clipboard image exceeds the 32 MiB limit.")
@@ -117,6 +243,9 @@ def validate_png(data):
 
 def save_image(data, directory):
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.name != "nt":
+        private_directory(directory, create=True)
+        cleanup_images(directory)
     # A unique, private snapshot prevents another submission from changing this turn's image.
     fd, name = tempfile.mkstemp(prefix="clipboard-", suffix=".png", dir=directory)
     try:
@@ -228,7 +357,7 @@ def merge_hooks(document, command, managed_script=None):
     return document
 
 
-def install(codex_home, url):
+def install(codex_home, url, private_socket=False, cleanup_timer=False):
     if os.name == "nt":
         raise ClipboardError("Install this hook on the remote Linux/macOS host where Codex runs.")
     endpoint_url(url)
@@ -248,12 +377,16 @@ def install(codex_home, url):
         atomic_write(backup, old)
         print("Existing hooks backed up to " + str(backup))
     atomic_write(destination, Path(__file__).read_bytes())
-    atomic_write(config, json.dumps({"url": url}).encode())
+    endpoint = {"socket": str(private_directory(destination.parent, create=True) / "bridge.sock")} if private_socket else {"url": url}
+    atomic_write(config, json.dumps(endpoint).encode())
     if old != new:
         atomic_write(hooks_path, new)
+    if cleanup_timer:
+        install_cleanup_timer(destination)
+        cleanup_images(Path.home() / ".cache" / "clipaste" / "codex-images")
     print("Installed @clipboard hook in " + str(hooks_path))
     print("Restart Codex and review/trust the hook in /hooks. Then submit: Explain this @clipboard")
-    print("Images are fetched at submission time and retained in ~/.cache/clipaste/codex-images.")
+    print("Images are fetched at submission time and expire after 24 hours.")
 
 
 def main():
@@ -263,12 +396,22 @@ def main():
     setup.add_argument("--codex-home", type=Path,
                        default=Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))))
     setup.add_argument("--url", default=DEFAULT_URL)
+    setup.add_argument("--private-socket", action="store_true")
+    setup.add_argument("--cleanup-timer", action="store_true")
+    sub.add_parser("cleanup", help="Delete private snapshots older than 24 hours")
+    prepare = sub.add_parser("prepare-socket", help="Validate the private socket directory and remove a stale socket")
+    prepare.add_argument("--codex-home", type=Path,
+                         default=Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))))
     run = sub.add_parser("run", help="Codex invokes this; reads the hook event on stdin")
     run.add_argument("--config", type=Path, required=True)
     args = parser.parse_args()
     try:
         if args.action == "install":
-            install(args.codex_home.expanduser().resolve(), args.url)
+            install(args.codex_home.expanduser().resolve(), args.url, args.private_socket, args.cleanup_timer)
+        elif args.action == "cleanup":
+            cleanup_images(Path.home() / ".cache" / "clipaste" / "codex-images")
+        elif args.action == "prepare-socket":
+            print(json.dumps({"socket": prepare_socket(args.codex_home.expanduser().resolve())}))
         else:
             raw = sys.stdin.buffer.read(MAX_INPUT + 1)
             if len(raw) > MAX_INPUT:
@@ -281,11 +424,13 @@ def main():
                 return 0
             config = json.loads(args.config.read_text())
             directory = Path.home() / ".cache" / "clipaste" / "codex-images"
-            result = handle_session_event(event, config["url"], directory,
-                                          directory.parent / "hook-state")
+            endpoint = config.get("socket") or config["url"]
+            fetch = fetch_private_image if "socket" in config else fetch_image
+            result = handle_session_event(event, endpoint, directory,
+                                          directory.parent / "hook-state", fetch)
             if result:
                 print(json.dumps(result))
-    except (ClipboardError, OSError, ValueError, KeyError) as exc:
+    except (ClipboardError, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
         if args.action == "run":
             # Exit 2 is Codex's documented blocking hook result, not a silent fallback.
             print("clipaste: " + str(exc), file=sys.stderr)

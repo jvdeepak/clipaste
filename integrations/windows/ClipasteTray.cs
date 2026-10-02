@@ -18,6 +18,7 @@ namespace ClipasteDesktop {
     public class Host {
         public string alias { get; set; }
         public int remotePort { get; set; }
+        public string remoteSocket { get; set; }
         public bool enabled { get; set; }
         public Host() { remotePort = 18340; enabled = true; }
     }
@@ -44,10 +45,11 @@ namespace ClipasteDesktop {
             if (config == null || config.version != 1 || config.hosts == null) throw new Exception("Invalid host configuration.");
             var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (Host host in config.hosts)
-                if (!ValidAlias(host.alias) || host.remotePort < 1 || host.remotePort > 65535 || !seen.Add(host.alias))
+                if (!ValidAlias(host.alias) || host.remotePort < 1 || host.remotePort > 65535 || !seen.Add(host.alias) || (!String.IsNullOrEmpty(host.remoteSocket) && !ValidSocket(host.remoteSocket)))
                     throw new Exception("Invalid or duplicate SSH host in bridge-hosts.json.");
             return config;
         }
+        public static bool ValidSocket(string value) { return value != null && value.Length < 100 && Regex.IsMatch(value, @"\A/[A-Za-z0-9_./-]+/bridge\.sock\z") && !value.Split('/').Contains(".."); }
         public static void Update(Action<Config> change) {
             using (var mutex = new Mutex(false, @"Local\clipaste-codex-config")) {
                 bool held = false;
@@ -100,12 +102,30 @@ namespace ClipasteDesktop {
         public DateTime Next = DateTime.MinValue, Started;
         public int Failures;
         public string Error = "";
+        Task<string> preparation;
         public string LogName { get { return "ssh-" + Files.Key(Host.alias) + ".stderr.log"; } }
         public Tunnel(Host host) { Host = host; }
         public void Start() {
+            if (preparation == null) {
+                // Remote preparation is independent per host; an offline host must not stall others.
+                preparation = Task.Run(() => {
+                    if (String.IsNullOrEmpty(Host.remoteSocket)) Program.InstallHook(Host.alias, Host.remotePort);
+                    return Program.PrepareSocket(Host.alias);
+                });
+                return;
+            }
+            if (!preparation.IsCompleted) return;
+            string remoteSocket;
+            try { remoteSocket = preparation.GetAwaiter().GetResult(); }
+            finally { preparation = null; }
+            if (!Files.ValidSocket(remoteSocket)) throw new Exception("The remote private socket path is invalid.");
+            if (Host.remoteSocket != remoteSocket) {
+                Files.Update(c => { Host entry = c.hosts.FirstOrDefault(h => String.Equals(h.alias, Host.alias, StringComparison.OrdinalIgnoreCase)); if (entry != null) entry.remoteSocket = remoteSocket; });
+                Host.remoteSocket = remoteSocket;
+            }
             Confirmed = false; Error = ""; Started = DateTime.UtcNow;
             Process = new Process();
-            Process.StartInfo = Program.Hidden(Program.Ssh, "-N -T -v -o BatchMode=yes -o ConnectTimeout=10 -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -o ControlMaster=no -o ControlPath=none -R 127.0.0.1:" + Host.remotePort + ":127.0.0.1:18340 " + Host.alias);
+            Process.StartInfo = Program.Hidden(Program.Ssh, "-N -T -v -o BatchMode=yes -o ConnectTimeout=10 -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -o ForwardAgent=no -o ForwardX11=no -o ControlMaster=no -o ControlPath=none -R " + Program.Quote(remoteSocket + ":127.0.0.1:18340") + " " + Host.alias);
             Process.StartInfo.RedirectStandardError = true;
             Process.ErrorDataReceived += (s, e) => {
                 if (e.Data == null) return;
@@ -115,6 +135,7 @@ namespace ClipasteDesktop {
             Process.Start(); Process.BeginErrorReadLine();
         }
         public void Dispose() {
+            preparation = null;
             if (Process == null) return;
             // Only the dedicated process created by this tunnel is terminated.
             if (!Process.HasExited) { Process.Kill(); Process.WaitForExit(3000); }
@@ -123,7 +144,7 @@ namespace ClipasteDesktop {
         public HostState State() {
             bool alive = Process != null && !Process.HasExited;
             return new HostState { alias = Host.alias, remotePort = Host.remotePort, pid = alive ? Process.Id : 0,
-                state = alive ? (Confirmed ? "connected" : "connecting") : "retrying", error = Error, log = LogName };
+                state = alive ? (Confirmed ? "connected" : "connecting") : preparation != null ? "preparing" : "retrying", error = Error, log = LogName };
         }
     }
     public sealed class Bridge : IDisposable {
@@ -246,7 +267,7 @@ namespace ClipasteDesktop {
             layout.Controls.Add(new Label { Text = "Clipaste", Font = new Font("Segoe UI", 20, FontStyle.Bold), Dock = DockStyle.Fill });
             summary.Dock = DockStyle.Fill; layout.Controls.Add(summary);
             hosts.Dock = DockStyle.Fill; hosts.View = View.Details; hosts.FullRowSelect = true; hosts.HideSelection = false; hosts.MultiSelect = false;
-            hosts.Columns.Add("SSH host", 245); hosts.Columns.Add("Connection", 105); hosts.Columns.Add("Remote port", 95); hosts.Columns.Add("Details", 315); layout.Controls.Add(hosts);
+            hosts.Columns.Add("SSH host", 245); hosts.Columns.Add("Connection", 105); hosts.Columns.Add("Access", 105); hosts.Columns.Add("Details", 305); layout.Controls.Add(hosts);
             var actions = new FlowLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(0, 7, 0, 0) };
             AddButton(actions, "Add host…", AddHost); AddButton(actions, "Start", () => EnableSelected(true)); AddButton(actions, "Stop", () => EnableSelected(false));
             AddButton(actions, "Reconnect", () => { Bridge.Reconnect(Selected()); }); AddButton(actions, "Host log", () => OpenLog("ssh-" + Files.Key(Selected()) + ".stderr.log"));
@@ -286,10 +307,10 @@ namespace ClipasteDesktop {
             HostState[] states = bridge == null ? new HostState[0] : bridge.Snapshot();
             string selected = hosts.SelectedItems.Count > 0 ? hosts.SelectedItems[0].Text : "";
             hosts.BeginUpdate(); hosts.Items.Clear();
-            foreach (var state in states) { var item = new ListViewItem(new[] { state.alias, state.state, state.remotePort.ToString(), state.error }); item.Selected = state.alias == selected; hosts.Items.Add(item); }
+            foreach (var state in states) { var item = new ListViewItem(new[] { state.alias, state.state, "Your account", state.error }); item.Selected = state.alias == selected; hosts.Items.Add(item); }
             hosts.EndUpdate();
             int connected = states.Count(h => h.state == "connected");
-            summary.Text = bridge != null && !String.IsNullOrEmpty(bridge.Error) ? bridge.Error : connected + " of " + states.Length + " hosts connected · clipboard stays on this PC until requested";
+            summary.Text = bridge != null && !String.IsNullOrEmpty(bridge.Error) ? bridge.Error : connected + " of " + states.Length + " hosts connected · private account access · images expire after 24 hours";
             trayStatus.Text = connected + " of " + states.Length + " hosts connected";
             trayClipboard.Text = "Clipboard: " + clipboardDetail;
             string nextIcon = clipboardKind + (connected > 0 ? "+" : "-");
@@ -322,12 +343,12 @@ namespace ClipasteDesktop {
         async void AddHost() {
             using (var dialog = new Form { Text = "Add SSH host", ClientSize = new Size(480, 235), StartPosition = FormStartPosition.CenterParent, FormBorderStyle = FormBorderStyle.FixedDialog, MaximizeBox = false, MinimizeBox = false, Font = Font }) {
                 var alias = new TextBox { Left = 20, Top = 48, Width = 440 };
-                var port = new NumericUpDown { Left = 20, Top = 111, Width = 120, Minimum = 1, Maximum = 65535, Value = 18340 };
+                var access = new Label { Left = 20, Top = 85, Width = 440, Height = 48, Text = "Uses a private socket accessible only to your remote account.\nSnapshots are automatically deleted after 24 hours." };
                 var install = new CheckBox { Left = 20, Top = 149, Width = 440, Text = "Install / update the Codex hook on this host", Checked = true };
                 var ok = new Button { Text = "Add", Left = 280, Top = 190, DialogResult = DialogResult.OK }; var cancel = new Button { Text = "Cancel", Left = 370, Top = 190, DialogResult = DialogResult.Cancel };
-                dialog.Controls.AddRange(new Control[] { new Label { Left = 20, Top = 20, Width = 440, Text = "SSH alias (from your existing Windows SSH configuration)" }, alias, new Label { Left = 20, Top = 85, Width = 300, Text = "Remote clipboard port" }, port, install, ok, cancel }); dialog.AcceptButton = ok; dialog.CancelButton = cancel;
+                dialog.Controls.AddRange(new Control[] { new Label { Left = 20, Top = 20, Width = 440, Text = "SSH alias (from your existing Windows SSH configuration)" }, alias, access, install, ok, cancel }); dialog.AcceptButton = ok; dialog.CancelButton = cancel;
                 if (dialog.ShowDialog(this) != DialogResult.OK) return;
-                string name = alias.Text.Trim(); int remotePort = (int)port.Value;
+                string name = alias.Text.Trim();
                 if (!Files.ValidAlias(name)) { MessageBox.Show(this, "Enter a valid SSH alias."); return; }
                 bool installHook = install.Checked;
                 using (var progress = new Form { Text = "Configuring " + name, ClientSize = new Size(580, 180), StartPosition = FormStartPosition.CenterParent, ControlBox = false }) {
@@ -335,8 +356,9 @@ namespace ClipasteDesktop {
                     Enabled = false; progress.Show(this);
                     try {
                         await Task.Run(() => {
-                            if (installHook) Program.InstallHook(name, remotePort);
-                            Files.Update(c => { c.hosts.RemoveAll(h => String.Equals(h.alias, name, StringComparison.OrdinalIgnoreCase)); c.hosts.Add(new Host { alias = name, remotePort = remotePort }); });
+                            if (installHook) Program.InstallHook(name, 18340);
+                            string remoteSocket = Program.PrepareSocket(name);
+                            Files.Update(c => { c.hosts.RemoveAll(h => String.Equals(h.alias, name, StringComparison.OrdinalIgnoreCase)); c.hosts.Add(new Host { alias = name, remoteSocket = remoteSocket }); });
                         });
                         MessageBox.Show(progress, installHook ? "Host added. In remote Codex, open /hooks and trust the clipaste hook once. Then use @clipboard in your prompt." : "Host added. The bridge will connect automatically.", "Clipaste");
                     } catch (Exception ex) { MessageBox.Show(progress, ex.Message, "Host setup failed"); }
@@ -352,13 +374,14 @@ namespace ClipasteDesktop {
         public static string Ssh = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), @"System32\OpenSSH\ssh.exe");
         public static string Quote(string value) { return "\"" + value.Replace("\"", "\\\"") + "\""; }
         public static ProcessStartInfo Hidden(string file, string arguments) { return new ProcessStartInfo(file, arguments) { UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden }; }
-        static void Run(string file, string arguments) {
+        static string Run(string file, string arguments, bool log = true) {
             var info = Hidden(file, arguments); info.RedirectStandardOutput = true; info.RedirectStandardError = true;
             using (var process = new Process { StartInfo = info }) {
                 process.Start(); var output = process.StandardOutput.ReadToEndAsync(); var error = process.StandardError.ReadToEndAsync();
                 if (!process.WaitForExit(60000)) { process.Kill(); throw new Exception("SSH setup timed out. Check host reachability and key authentication."); }
-                Task.WaitAll(output, error); Files.Log("setup.log", output.Result + error.Result);
+                Task.WaitAll(output, error); if (log) Files.Log("setup.log", output.Result + error.Result);
                 if (process.ExitCode != 0) throw new Exception("Remote setup failed: " + error.Result + "\nSee setup.log in the logs folder.");
+                return output.Result;
             }
         }
         public static void InstallHook(string alias, int port) {
@@ -366,7 +389,18 @@ namespace ClipasteDesktop {
             string options = "-n -o BatchMode=yes -o ConnectTimeout=10 " + alias + " ";
             Run(Ssh, options + Quote("mkdir -p ~/.local/share/clipaste-codex"));
             Run(Path.Combine(Path.GetDirectoryName(Ssh), "scp.exe"), "-o BatchMode=yes -o ConnectTimeout=10 " + Quote(Files.At("clipboard_hook.py")) + " " + alias + ":.local/share/clipaste-codex/clipboard_hook.py");
-            Run(Ssh, options + Quote("~/.local/bin/uv run --offline --no-project --python 3.11 ~/.local/share/clipaste-codex/clipboard_hook.py install --url http://127.0.0.1:" + port));
+            Run(Ssh, options + Quote("~/.local/bin/uv run --offline --no-project --python 3.11 ~/.local/share/clipaste-codex/clipboard_hook.py install --private-socket --cleanup-timer"));
+        }
+        public static string PrepareSocket(string alias) {
+            if (!Files.ValidAlias(alias)) throw new Exception("Invalid SSH alias.");
+            string config = Run(Ssh, "-G " + alias, false);
+            if (Regex.IsMatch(config, @"(?m)^(remoteforward|localforward|dynamicforward)\s"))
+                throw new Exception("This SSH alias has inherited port forwards. Remove those forwards or use an alias without them before enabling the private bridge.");
+            string output = Run(Ssh, "-n -o BatchMode=yes -o ConnectTimeout=10 " + alias + " " + Quote("~/.local/bin/uv run --offline --no-project --python 3.11 ~/.local/share/clipaste-codex/clipboard_hook.py prepare-socket"));
+            var result = new JavaScriptSerializer().Deserialize<Dictionary<string, string>>(output);
+            string path = result["socket"];
+            if (!Files.ValidSocket(path)) throw new Exception("The remote private socket path is invalid.");
+            return path;
         }
         [STAThread] public static int Main(string[] args) {
             Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
@@ -410,6 +444,7 @@ namespace ClipasteDesktop {
             Files.Root = Path.Combine(Path.GetTempPath(), "clipaste-test-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(Files.Root);
             try {
                 if (Files.ValidAlias("host;cmd") || Files.ValidAlias("-bad") || !Files.ValidAlias("user@host-01")) throw new Exception("Alias validation");
+                if (!Files.ValidSocket("/home/user/.codex/clipaste/bridge.sock") || Files.ValidSocket("/tmp/../bridge.sock") || Files.ValidSocket("/tmp/x:2/bridge.sock")) throw new Exception("Socket validation");
                 Files.Write(Files.At("bridge-hosts.json"), new { version = 1, hosts = new[] { new { alias = "host-a", remotePort = 18340 }, new { alias = "host-b", remotePort = 18341 } } });
                 if (Files.Load().hosts.Any(h => !h.enabled)) throw new Exception("Legacy enabled default");
                 Files.Update(c => c.hosts[0].enabled = false);

@@ -2,7 +2,7 @@
   #define BuildDir "..\..\target\desktop"
 #endif
 #ifndef AppVersion
-  #define AppVersion "2.6.0.1"
+  #define AppVersion "2.6.1.0"
 #endif
 [Setup]
 AppId={{A8A74E40-D630-4DAC-9B13-CCBB54A08DC6}

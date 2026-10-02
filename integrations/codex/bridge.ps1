@@ -13,7 +13,7 @@ $config = Join-Path $directory 'bridge-hosts.json'
 switch ($Action) {
     'add' {
         if (-not $HostAlias) { throw 'Usage: clipaste-bridge add SSH_ALIAS' }
-        & (Join-Path $PSScriptRoot 'setup-windows.ps1') -HostAlias $HostAlias -RemotePort $RemotePort
+        & (Join-Path $PSScriptRoot 'setup-windows.ps1') -HostAlias $HostAlias
     }
     'remove' {
         if (-not $HostAlias) { throw 'Usage: clipaste-bridge remove SSH_ALIAS' }

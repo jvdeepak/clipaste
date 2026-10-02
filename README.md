@@ -55,7 +55,8 @@ See [clipboard history compatibility](docs/clipboard-history.md) for details.
 Linux also uses the private stable PNG cache (`~/.cache/clipaste`, directory
 mode `0700`, files `0600`). Clearing the clipboard, copying non-image content,
 or encountering a recognized private marker clears the staged image served over
-HTTP. Historical cached paths are retained; clearing the clipboard does not erase them.
+HTTP. This fork deletes cached snapshots after 24 hours. Clearing the clipboard
+does not immediately erase them; older conversation image paths expire too.
 
 ### macOS (Homebrew)
 

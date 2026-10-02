@@ -194,7 +194,9 @@ For development, `cargo build --release` works from the checkout. Linux retains
   Image file-copy offering only a URI is not supported yet.
 - Clipboard clears, non-image content, and recognized private markers clear
   the staged image. Historical cache paths remain; this is not cache erasure.
-  Keep cache directories `0700` and files `0600`, with no automatic expiry.
+  Keep cache directories `0700` and files `0600`. This fork expires snapshots
+  after 24 hours, as explicitly requested by the user; cleanup must never follow
+  symlinks or remove unrelated files. Older conversation image paths can expire.
 - Preserve existing macOS/Windows clipboard normalization and paste workflows.
   Linux tests do not establish macOS/Windows regression coverage or universal
   desktop compatibility; report exactly which platforms were verified.

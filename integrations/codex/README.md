@@ -12,7 +12,7 @@ switching, custom Codex build, or Alacritty keybinding is required.
 This is a submit-time image workflow, not an attachment preview in the composer.
 The screenshot that is on the clipboard **when you submit** is the one used.
 Keep the screenshot on the clipboard while typing your prompt. Each marked
-submission gets its own immutable image file. Ordinary prompts never access
+submission gets its own immutable image file that expires after 24 hours. Ordinary prompts never access
 the clipboard. An empty or damaged image blocks the marked submission. When the
 bridge is offline, the first marked request reports an error; subsequent requests
 in the same Codex session suppress duplicate hook errors and tell the model that
@@ -43,73 +43,32 @@ does not bypass trust or modify your other Codex settings.
 
 ## Windows bridge
 
-**Recommended:** use the [Windows desktop installer](../windows/README.md).
-It provides a setup wizard, notification-area app, independent host controls,
-live text/image preview, logs, automatic startup and uninstall. It preserves
-existing host settings and does not require PowerShell commands. The commands
-below remain available for development and older script-based installations.
+Use the [graphical Windows installer](../windows/README.md). It provides a tray
+app, host controls, live clipboard previews, logs, startup and uninstall.
+No PowerShell commands are required. Existing hosts migrate automatically.
 
-Use a build of this fork: the upstream v2.5.0 Windows release does not support
-server-only mode. The fork also clears stale screenshots when the clipboard is
-changed to text, and captures an image already on the clipboard at startup.
+Each remote uses `$CODEX_HOME/clipaste/bridge.sock` (normally
+`~/.codex/clipaste/bridge.sock`) inside an account-owned directory with mode 0700.
+The native bridge never creates a shared remote TCP clipboard port. Other ordinary
+users cannot traverse the socket directory. Your own account and remote root
+remain trusted. SSH aliases with inherited forwarding directives are rejected
+rather than silently exposing an additional port. No insecure fallback is used.
 
-From this repository on Windows, one command installs the remote hook, creates
-the Windows Startup shortcut, starts the bridge, and checks the tunnel:
+The Add host dialog installs the runtime, private endpoint and a per-user cleanup
+cron job. Remote setup requires uv, Python 3.11, OpenSSH Unix-domain forwarding and
+working crontab support. Existing cron entries and portable hook registrations are
+preserved. Each host still needs one-time Codex `/hooks` review.
 
-```powershell
-.\integrations\codex\setup-windows.ps1 -HostAlias stssgoffmgt01-rh8 -BinaryPath .\target\release\clipaste.exe
-```
+Images expire after 24 hours. The Windows daemon sweeps its cache every minute
+while running and at startup; each remote independently sweeps its private Codex
+snapshot directory every minute through cron. Cleanup also runs on marked image
+submissions. A sleeping/offline machine catches up once it runs again. Old image
+paths in conversations therefore stop working after expiry. Cleanup skips symlinks
+and unrelated files. Removing the Windows app does not remove the remote cleanup job.
 
-Alternatively, point `-BinaryPath` to `clipaste.exe` downloaded from this fork's
-`clipaste-windows` Check workflow artifact. `-RemotePython python3.11` is the
-default; specify another Python 3.9+ executable if needed. After installation,
-review the hook once in Codex `/hooks`.
-
-After the first installation, use these commands in a new Windows shell:
-
-```powershell
-clipaste-bridge add sgxmgt01-rh8
-clipaste-bridge status
-clipaste-bridge start
-clipaste-bridge stop
-clipaste-bridge remove sgxmgt01-rh8
-```
-
-`add` installs the remote hook and registers an SSH alias without replacing other
-hosts. One Windows clipboard daemon is shared by independent tunnels for all
-configured hosts. Each tunnel reconnects independently, with backoff up to 60
-seconds. Adding/removing a host hot-reloads the config and leaves other tunnels
-alone. Multiple Alacritty windows share their server's tunnel; keep using your
-normal `ssh HOST` commands. SSH must authenticate non-interactively, with normal
-host-key verification. Removing a host closes its tunnel but retains remote hook
-files and previously saved images. Each server needs the one-time hook review.
-
-The host list lives in `%LOCALAPPDATA%\clipaste\bridge-hosts.json`. The Startup
-shortcut launches the supervisor without a hostname. Old single-host launch
-commands and shortcuts are migrated without dropping their original host.
-Each distinct server can use remote port 18340; `add HOST -RemotePort 19340`
-selects a different port if needed. Do not configure two aliases for the same
-physical server/listen port. `status` reports SSH process state, not a remote
-health guarantee; setup also checks the remote HTTP endpoint.
-
-Do not also add the same `RemoteForward` through `clipaste ssh-setup` for this
-host. The supervisor owns the port so multiple Alacritty windows can share it.
-Its endpoint is accessible to processes on the remote machine, as with upstream
-clipaste; use this with a trusted remote host. It never binds a public address.
-
-Logs are in `%LOCALAPPDATA%\clipaste\bridge.log` and per-host `ssh-*.stderr.log`
-files (the exact path appears in `status`). To stop all tunnels, run
-`clipaste-bridge stop`. Remove the
-Startup shortcut to disable login startup. The clipboard daemon is left running
-for other consumers. To remove the Codex integration, remove its one hook entry
-from `hooks.json` and the `clipaste` subdirectory; leave other hook entries intact.
-
-Images are retained in `~/.cache/clipaste/codex-images` with mode `0600` and are
-not automatically deleted, so older conversations retain their image paths.
-Delete unwanted images there when no longer needed.
-
-Claude Code's existing clipboard-helper workflow remains available; the daemon
-and tunnel can be shared. This feature itself installs only a Codex hook.
+The old script supervisor delegates to the native app. The legacy upstream TCP
+helpers described elsewhere are separate from this private Codex integration;
+this integration does not install Claude clipboard shims.
 
 ## Portable Codex settings
 

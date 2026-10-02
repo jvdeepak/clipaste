@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import socket
 import struct
 import subprocess
 import sys
@@ -30,6 +31,82 @@ PNG = (b"\x89PNG\r\n\x1a\n"
 
 
 class HookTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "Unix account permissions")
+    def test_private_socket_directory_and_stale_socket_handling(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            path = Path(hook.prepare_socket(home))
+            self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+                server.bind(str(path))
+                server.listen(1)
+                with self.assertRaisesRegex(hook.ClipboardError, "already owns"):
+                    hook.prepare_socket(home)
+            self.assertTrue(path.exists())
+            hook.prepare_socket(home)
+            self.assertFalse(path.exists())
+            path.symlink_to(home / "unrelated")
+            with self.assertRaises(hook.ClipboardError):
+                hook.prepare_socket(home)
+            self.assertTrue(path.is_symlink())
+            path.parent.chmod(0o755)
+            with self.assertRaisesRegex(hook.ClipboardError, "0700"):
+                hook.socket_path(str(path))
+
+    @unittest.skipIf(os.name == "nt", "Unix account permissions")
+    def test_cleanup_24_hour_boundary_and_safe_file_selection(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            images = root / "images"
+            images.mkdir(mode=0o700)
+            old = images / "clipboard-old.png"
+            fresh = images / "clipboard-new.png"
+            unrelated = images / "unrelated.png"
+            for file in (old, fresh, unrelated):
+                file.write_bytes(PNG)
+            os.utime(old, (0, 0))
+            os.utime(fresh, (1, 1))
+            os.utime(unrelated, (0, 0))
+            link = images / "clipboard-link.png"
+            link.symlink_to(unrelated)
+            self.assertEqual(hook.cleanup_images(images, now=hook.RETENTION), 1)
+            self.assertFalse(old.exists())
+            self.assertTrue(fresh.exists())
+            self.assertTrue(link.is_symlink())
+            self.assertTrue(unrelated.exists())
+
+    def test_cleanup_cron_preserves_existing_jobs_and_is_idempotent(self):
+        original = "CRON_TZ=Asia/Singapore\n*/5 * * * * existing-job\n"
+        merged = hook.merge_cleanup_cron(original, "uv run script cleanup")
+        self.assertTrue(merged.startswith(original))
+        self.assertEqual(hook.merge_cleanup_cron(merged, "uv run script cleanup"), merged)
+        self.assertIn(r"\%", hook.merge_cleanup_cron(original, "'path%name' cleanup"))
+
+    @unittest.skipIf(os.name == "nt", "Unix account permissions")
+    def test_missing_private_socket_is_quiet_bridge_outage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = hook.prepare_socket(Path(temp))
+            with self.assertRaises(hook.BridgeUnavailable):
+                hook.fetch_private_image(path)
+
+    @unittest.skipIf(os.name == "nt", "Unix account permissions")
+    def test_private_fetch_checks_socket_owner_and_validates_image(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = hook.prepare_socket(Path(temp))
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                listener.bind(path)
+                with mock.patch.object(hook, "UnixHTTPConnection") as connection:
+                    response = self.response(PNG)
+                    response.getheader = response.headers.get
+                    connection.return_value.getresponse.return_value = response
+                    self.assertEqual(hook.fetch_private_image(path), PNG)
+                    connection.return_value.request.assert_called_once_with("GET", "/clipboard/image")
+                    connection.return_value.close.assert_called_once()
+            Path(path).unlink()
+            Path(path).write_bytes(PNG)
+            with self.assertRaisesRegex(hook.ClipboardError, "not a socket"):
+                hook.fetch_private_image(path)
+
     def event(self, prompt):
         return {"hook_event_name": "UserPromptSubmit", "prompt": prompt}
 

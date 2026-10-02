@@ -9,6 +9,7 @@ function Read-BridgeConfig([string]$Path) {
         if ($entry.remotePort -isnot [long] -and $entry.remotePort -isnot [int]) { throw 'Invalid remote port.' }
         if ($entry.remotePort -lt 1 -or $entry.remotePort -gt 65535) { throw 'Remote port must be 1-65535.' }
         if ($null -ne $entry.enabled -and $entry.enabled -isnot [bool]) { throw 'Host enabled must be true or false.' }
+        if ($entry.remoteSocket -and ($entry.remoteSocket -cnotmatch '^/[A-Za-z0-9_./-]+/bridge\.sock$' -or '..' -in ($entry.remoteSocket -split '/'))) { throw 'Invalid private socket path.' }
         $seen[$entry.alias] = $true
         $entry
     }
@@ -25,12 +26,16 @@ function Write-BridgeConfig([string]$Path, [array]$Hosts) {
         if (Test-Path -LiteralPath "$temporary.bak") { Remove-Item -LiteralPath "$temporary.bak" }
     }
 }
-function Set-BridgeHost([string]$Path, [string]$Alias, [int]$Port = 18340, [switch]$Remove) {
+function Set-BridgeHost([string]$Path, [string]$Alias, [int]$Port = 18340, [switch]$Remove, [string]$RemoteSocket) {
     $lock = New-Object Threading.Mutex($false, 'Local\clipaste-codex-config')
     if (-not $lock.WaitOne(10000)) { $lock.Dispose(); throw 'Another bridge config update is in progress.' }
     try {
         $entries = @(Read-BridgeConfig $Path | Where-Object { $_.alias -ine $Alias })
-        if (-not $Remove) { $entries += [pscustomobject]@{ alias = $Alias; remotePort = $Port } }
+        if (-not $Remove) {
+            $entry = [pscustomobject]@{ alias = $Alias; remotePort = $Port }
+            if ($RemoteSocket) { $entry | Add-Member -NotePropertyName remoteSocket -NotePropertyValue $RemoteSocket }
+            $entries += $entry
+        }
         Write-BridgeConfig $Path $entries
     } finally { $lock.ReleaseMutex(); $lock.Dispose() }
 }
