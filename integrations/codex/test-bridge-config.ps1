@@ -11,6 +11,10 @@ try {
     $current = @{ first = @{remotePort=18340}; second = @{remotePort=19340} }
     $changes = Get-BridgeChanges $entries $current
     Assert ($changes.Stop.Count -eq 0 -and $changes.Start.Count -eq 0) 'Unchanged tunnels restarted'
+    Set-BridgeHostEnabled $temporary 'first' $false
+    $changes = Get-BridgeChanges @(Read-BridgeConfig $temporary) $current
+    Assert ($changes.Stop.Count -eq 1 -and $changes.Stop[0] -eq 'first') 'Pausing one host affected another'
+    Set-BridgeHostEnabled $temporary 'first' $true
     Set-BridgeHost $temporary 'second' 20340
     $changes = Get-BridgeChanges @(Read-BridgeConfig $temporary) $current
     Assert ($changes.Stop.Count -eq 1 -and $changes.Stop[0] -eq 'second') 'Port update disrupted unrelated host'

@@ -64,6 +64,11 @@ if (Test-Path -LiteralPath $shortcutPath) {
     }
 }
 Set-BridgeHost $configPath $HostAlias $RemotePort
+if (Test-Path -LiteralPath (Join-Path $installDirectory 'ClipasteTray.exe')) {
+    Start-Process (Join-Path $installDirectory 'ClipasteTray.exe') -ArgumentList '--background' -WindowStyle Hidden
+    Write-Host "Host configured. Open Clipaste from the notification area to check its connection. Review /hooks once in Codex on $HostAlias."
+    return
+}
 $arguments = "-NoProfile -WindowStyle Hidden -File `"$bridgePath`""
 $shortcut = $shell.CreateShortcut($shortcutPath)
 $shortcut.TargetPath = $powershellPath

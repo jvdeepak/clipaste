@@ -43,6 +43,12 @@ does not bypass trust or modify your other Codex settings.
 
 ## Windows bridge
 
+**Recommended:** use the [Windows desktop installer](../windows/README.md).
+It provides a setup wizard, notification-area app, independent host controls,
+live text/image preview, logs, automatic startup and uninstall. It preserves
+existing host settings and does not require PowerShell commands. The commands
+below remain available for development and older script-based installations.
+
 Use a build of this fork: the upstream v2.5.0 Windows release does not support
 server-only mode. The fork also clears stale screenshots when the clipboard is
 changed to text, and captures an image already on the clipboard at startup.

@@ -21,10 +21,18 @@ switch ($Action) {
         Write-Output "Removed $HostAlias. Other hosts and remote hook files are unchanged."
     }
     'start' {
+        if (Test-Path -LiteralPath (Join-Path $directory 'ClipasteTray.exe')) {
+            Start-Process (Join-Path $directory 'ClipasteTray.exe') -ArgumentList '--background' -WindowStyle Hidden
+            return
+        }
         $exe = (Get-Command pwsh -ErrorAction Stop).Source
         Start-Process $exe -WindowStyle Hidden -ArgumentList "-NoProfile -WindowStyle Hidden -File `"$directory\windows-bridge.ps1`""
     }
-    'stop' { New-Item -ItemType File -Force -Path (Join-Path $directory 'bridge.stop') | Out-Null }
+    'stop' {
+        if (Test-Path -LiteralPath (Join-Path $directory 'ClipasteTray.exe')) {
+            Start-Process (Join-Path $directory 'ClipasteTray.exe') -ArgumentList '--shutdown' -WindowStyle Hidden -Wait
+        } else { New-Item -ItemType File -Force -Path (Join-Path $directory 'bridge.stop') | Out-Null }
+    }
     'status' {
         $statusPath = Join-Path $directory 'bridge-status.json'
         if (-not (Test-Path -LiteralPath $statusPath)) { Write-Output 'Bridge stopped.'; return }

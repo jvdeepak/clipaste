@@ -65,6 +65,25 @@ try {
             if ($configError -ne $_.Exception.Message) { Write-BridgeLog "Config error: $($_.Exception.Message)" }
             $configError = $_.Exception.Message
         }
+        $requests = Join-Path $InstallDirectory 'bridge-requests'
+        if (Test-Path -LiteralPath $requests) {
+            foreach ($requestFile in @(Get-ChildItem -LiteralPath $requests -Filter '*.json')) {
+                try {
+                    $request = Get-Content -LiteralPath $requestFile.FullName -Raw | ConvertFrom-Json
+                    if ($request.action -ne 'reconnect') { throw 'Unknown bridge request.' }
+                    foreach ($connection in @($connections.Values)) {
+                        if ($request.alias -and $connection.alias -ine $request.alias) { continue }
+                        Stop-Connection $connection
+                        $connection.process = $null
+                        $connection.failures = 0
+                        $connection.nextAttempt = [datetime]::MinValue
+                        $connection.error = ''
+                        Write-BridgeLog "[$($connection.alias)] Reconnect requested"
+                    }
+                } catch { Write-BridgeLog "Control request error: $($_.Exception.Message)" }
+                finally { Remove-Item -LiteralPath $requestFile.FullName }
+            }
+        }
         foreach ($connection in $connections.Values) {
             $alias = $connection.alias
             if ($null -ne $connection.process) {
@@ -84,7 +103,7 @@ try {
                 $key = Get-BridgeHostKey $alias
                 $connection.process = Start-Process -FilePath "$env:WINDIR\System32\OpenSSH\ssh.exe" `
                     -WindowStyle Hidden -PassThru -ArgumentList @(
-                        '-N', '-T', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+                        '-N', '-T', '-v', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
                         '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=15',
                         '-o', 'ServerAliveCountMax=2', '-o', 'ControlMaster=no', '-o', 'ControlPath=none',
                         '-R', "127.0.0.1:$($connection.remotePort):127.0.0.1:18340", $alias
@@ -100,9 +119,15 @@ try {
         }
         $states = @($connections.Values | ForEach-Object {
             $alive = $null -ne $_.process -and -not $_.process.HasExited
-            @{ alias = $_.alias; remotePort = $_.remotePort; state = $(if ($alive) { 'running' } else { 'retrying' })
+            $hostLog = Join-Path $InstallDirectory "ssh-$(Get-BridgeHostKey $_.alias).stderr.log"
+            $confirmed = $alive -and (Test-Path -LiteralPath $hostLog) -and
+                (Select-String -LiteralPath $hostLog -SimpleMatch 'remote forward success for:' -Quiet)
+            @{ alias = $_.alias; remotePort = $_.remotePort; state = $(if ($confirmed) { 'connected' } elseif ($alive) { 'connecting' } else { 'retrying' })
                pid = $(if ($alive) { $_.process.Id } else { $null }); error = $_.error
                log = "ssh-$(Get-BridgeHostKey $_.alias).stderr.log" }
+        })
+        $states += @($desired | Where-Object { $_.enabled -eq $false } | ForEach-Object {
+            @{ alias=$_.alias; remotePort=$_.remotePort; state='stopped'; pid=$null; error=''; log="ssh-$(Get-BridgeHostKey $_.alias).stderr.log" }
         })
         @{ version = 2; supervisorPid = $PID; updatedAt = (Get-Date).ToString('o'); configError = $configError; hosts = $states } |
             ConvertTo-Json -Depth 5 | Set-Content -LiteralPath "$statusPath.tmp" -Encoding utf8

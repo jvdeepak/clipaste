@@ -36,6 +36,15 @@ jobs:
       - name: Build Windows bridge executable
         if: runner.os == 'Windows'
         run: cargo build --locked --release
+      - name: Build and test Windows desktop installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./integrations/windows/build.ps1
+      - uses: actions/upload-artifact@v7
+        if: runner.os == 'Windows'
+        with:
+          name: clipaste-windows-installer
+          path: target/desktop/installer/*.exe
       - uses: actions/upload-artifact@v7
         if: runner.os == 'Windows'
         with:

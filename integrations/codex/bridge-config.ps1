@@ -8,6 +8,7 @@ function Read-BridgeConfig([string]$Path) {
         if ($seen.ContainsKey($entry.alias)) { throw "Duplicate SSH alias: $($entry.alias)" }
         if ($entry.remotePort -isnot [long] -and $entry.remotePort -isnot [int]) { throw 'Invalid remote port.' }
         if ($entry.remotePort -lt 1 -or $entry.remotePort -gt 65535) { throw 'Remote port must be 1-65535.' }
+        if ($null -ne $entry.enabled -and $entry.enabled -isnot [bool]) { throw 'Host enabled must be true or false.' }
         $seen[$entry.alias] = $true
         $entry
     }
@@ -34,11 +35,31 @@ function Set-BridgeHost([string]$Path, [string]$Alias, [int]$Port = 18340, [swit
     } finally { $lock.ReleaseMutex(); $lock.Dispose() }
 }
 function Get-BridgeChanges([array]$Desired, [hashtable]$Current) {
+    $Desired = @($Desired | Where-Object { $_.enabled -ne $false })
     $wanted = @{}
     foreach ($entry in $Desired) { $wanted[$entry.alias] = $entry }
     $stop = @($Current.Keys | Where-Object { -not $wanted.ContainsKey($_) -or $wanted[$_].remotePort -ne $Current[$_].remotePort })
     $start = @($Desired | Where-Object { -not $Current.ContainsKey($_.alias) -or $_.alias -in $stop })
     [pscustomobject]@{ Stop = $stop; Start = $start }
+}
+function Set-BridgeHostEnabled([string]$Path, [string]$Alias, [bool]$Enabled) {
+    $lock = New-Object Threading.Mutex($false, 'Local\clipaste-codex-config')
+    if (-not $lock.WaitOne(10000)) { $lock.Dispose(); throw 'Another config update is in progress.' }
+    try {
+        $entries = @(Read-BridgeConfig $Path)
+        $entry = $entries | Where-Object alias -IEQ $Alias
+        if (-not $entry) { throw "Unknown host: $Alias" }
+        $entry | Add-Member -NotePropertyName enabled -NotePropertyValue $Enabled -Force
+        Write-BridgeConfig $Path $entries
+    } finally { $lock.ReleaseMutex(); $lock.Dispose() }
+}
+function Request-BridgeReconnect([string]$Directory, [string]$Alias = '') {
+    if ($Alias -and $Alias -cnotmatch '^[A-Za-z0-9][A-Za-z0-9_.@-]*$') { throw 'Invalid SSH alias.' }
+    $requests = Join-Path $Directory 'bridge-requests'
+    New-Item -ItemType Directory -Force -Path $requests | Out-Null
+    $name = Join-Path $requests ([guid]::NewGuid().ToString('N'))
+    @{ action='reconnect'; alias=$Alias } | ConvertTo-Json | Set-Content -LiteralPath "$name.tmp" -Encoding utf8
+    Move-Item -LiteralPath "$name.tmp" -Destination "$name.json"
 }
 function Get-BridgeHostKey([string]$Alias) {
     $sha = [Security.Cryptography.SHA256]::Create()
