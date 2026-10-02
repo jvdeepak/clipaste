@@ -29,6 +29,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets
+      - name: Build Windows bridge executable
+        if: runner.os == 'Windows'
+        run: cargo build --locked --release
+      - uses: actions/upload-artifact@v7
+        if: runner.os == 'Windows'
+        with:
+          name: clipaste-windows
+          path: target/release/clipaste.exe
 
   linux-desktop:
     runs-on: ubuntu-latest
