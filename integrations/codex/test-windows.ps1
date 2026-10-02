@@ -44,7 +44,7 @@ try {
     if (-not [Windows.Forms.Clipboard]::ContainsImage()) { throw 'Daemon changed the image clipboard.' }
     Write-Host "Synthetic test image staged; verification code $code"
 
-    $hookCommand = "$RemotePython ~/.codex/clipaste/clipboard_hook.py run --config ~/.codex/clipaste/endpoint.json"
+    $hookCommand = "~/.local/bin/uv run --offline --no-project --python $RemotePython ~/.codex/clipaste/clipboard_hook.py run --config ~/.codex/clipaste/endpoint.json"
     $eventJson = '{"hook_event_name":"UserPromptSubmit","prompt":"Inspect @clipboard"}'
     $hookOutput = $eventJson | & ssh -o BatchMode=yes $HostAlias $hookCommand
     if ($LASTEXITCODE -ne 0) { throw 'Remote hook failed to fetch the Windows image.' }

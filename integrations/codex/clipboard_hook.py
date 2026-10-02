@@ -2,6 +2,7 @@
 """Opt-in clipboard images for stock Codex; Python standard library only."""
 
 import argparse
+import hashlib
 import json
 import http.client
 import os
@@ -25,6 +26,10 @@ DEFAULT_URL = "http://127.0.0.1:18340"
 
 
 class ClipboardError(Exception):
+    pass
+
+
+class BridgeUnavailable(ClipboardError):
     pass
 
 
@@ -68,7 +73,7 @@ def fetch_image(url):
             if length and len(image) != int(length):
                 raise ClipboardError("Clipboard transfer was incomplete. Copy the screenshot and retry.")
     except (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException) as exc:
-        raise ClipboardError("Cannot reach clipaste. Check the Windows daemon and reconnect SSH.") from exc
+        raise BridgeUnavailable("Cannot reach clipaste. Start the Windows bridge with clipaste-bridge start.") from exc
     if not image:
         raise ClipboardError("No image on the clipboard. Copy a screenshot and submit again.")
     validate_png(image)
@@ -150,7 +155,44 @@ def atomic_write(path, data):
         Path(name).unlink(missing_ok=True)
 
 
-def merge_hooks(document, command):
+def handle_session_event(event, url, directory, state_directory, fetch=fetch_image):
+    if not wants_image(event):
+        return None
+    # Keep warning state local, separate for each conversation and endpoint.
+    session = event.get("session_id")
+    if not session:
+        return handle_event(event, url, directory, fetch)
+    key = hashlib.sha256((str(session) + "\0" + url).encode()).hexdigest()
+    state_path = state_directory / (key + ".json")
+    try:
+        state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    except (ValueError, OSError):
+        state = {}
+    unavailable = {"hookSpecificOutput": {
+        "hookEventName": "UserPromptSubmit",
+        "additionalContext": "No image was supplied for @clipboard: the clipboard bridge is still offline. "
+        "The user has already been notified of this outage. Do not repeat the bridge warning or retry "
+        "the transfer. Never claim to see an image. Address independently answerable text; "
+        "if the request requires the missing image, briefly say it is unavailable."
+    }}
+    if time.time() < state.get("retry_after", 0):
+        return unavailable
+    try:
+        result = handle_event(event, url, directory, fetch)
+    except BridgeUnavailable:
+        atomic_write(state_path, json.dumps({"retry_after": time.time() + 15}).encode())
+        if state:
+            return unavailable
+        raise
+    # An empty clipboard also demonstrates that the bridge has recovered.
+    except ClipboardError:
+        state_path.unlink(missing_ok=True)
+        raise
+    state_path.unlink(missing_ok=True)
+    return result
+
+
+def merge_hooks(document, command, managed_script=None):
     # Never replace another integration's hook group, including inline TOML hooks.
     if not isinstance(document, dict):
         raise ClipboardError("hooks.json must contain a JSON object; it was left unchanged.")
@@ -160,6 +202,22 @@ def merge_hooks(document, command):
     groups = hooks.setdefault("UserPromptSubmit", [])
     if not isinstance(groups, list):
         raise ClipboardError("Invalid UserPromptSubmit hooks; hooks.json was left unchanged.")
+    if managed_script:
+        # Changing Python installations must not register the same hook a second time.
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                continue
+            retained = []
+            for item in group["hooks"]:
+                old = item.get("command", "") if isinstance(item, dict) else ""
+                try:
+                    obsolete = old != command and str(managed_script) in shlex.split(old)
+                except ValueError:
+                    obsolete = False
+                if not obsolete:
+                    retained.append(item)
+            group["hooks"] = retained
+        groups[:] = [group for group in groups if not isinstance(group, dict) or group.get("hooks") != []]
     for group in groups:
         if isinstance(group, dict):
             for hook in group.get("hooks", []):
@@ -180,7 +238,10 @@ def install(codex_home, url):
     old = hooks_path.read_bytes() if hooks_path.exists() else None
     document = json.loads(old) if old is not None else {}
     command = shlex.join([sys.executable, str(destination), "run", "--config", str(config)])
-    merged = merge_hooks(document, command)
+    managed_command = destination.with_name("managed-command.txt")
+    if managed_command.exists():
+        command = managed_command.read_text().strip()
+    merged = merge_hooks(document, command, destination)
     new = (json.dumps(merged, indent=2, ensure_ascii=False) + "\n").encode()
     if old and old != new:
         backup = hooks_path.with_name("hooks.json.clipaste-" + str(time.time_ns()) + ".bak")
@@ -220,7 +281,8 @@ def main():
                 return 0
             config = json.loads(args.config.read_text())
             directory = Path.home() / ".cache" / "clipaste" / "codex-images"
-            result = handle_event(event, config["url"], directory)
+            result = handle_session_event(event, config["url"], directory,
+                                          directory.parent / "hook-state")
             if result:
                 print(json.dumps(result))
     except (ClipboardError, OSError, ValueError, KeyError) as exc:

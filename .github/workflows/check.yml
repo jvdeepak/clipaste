@@ -29,6 +29,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets
+      - name: Test multi-host bridge configuration
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./integrations/codex/test-bridge-config.ps1
       - name: Build Windows bridge executable
         if: runner.os == 'Windows'
         run: cargo build --locked --release

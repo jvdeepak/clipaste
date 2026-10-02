@@ -101,8 +101,30 @@ class HookTests(unittest.TestCase):
             with self.assertRaises(hook.ClipboardError):
                 hook.fetch_image(hook.DEFAULT_URL)
             build.return_value.open.side_effect = TimeoutError()
-            with self.assertRaisesRegex(hook.ClipboardError, "reconnect SSH"):
+            with self.assertRaisesRegex(hook.ClipboardError, "clipaste-bridge start"):
                 hook.fetch_image(hook.DEFAULT_URL)
+
+    def test_outage_warns_once_per_session_then_recovers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            images, states = Path(temp) / "images", Path(temp) / "states"
+            event = dict(self.event("@clipboard"), session_id="session-one")
+            offline = mock.Mock(side_effect=hook.BridgeUnavailable("offline"))
+            with mock.patch.object(hook.time, "time", return_value=100):
+                with self.assertRaises(hook.BridgeUnavailable):
+                    hook.handle_session_event(event, "test", images, states, offline)
+                result = hook.handle_session_event(event, "test", images, states, offline)
+                self.assertIn("No image was supplied", result["hookSpecificOutput"]["additionalContext"])
+                self.assertEqual(offline.call_count, 1)
+            with mock.patch.object(hook.time, "time", return_value=120):
+                hook.handle_session_event(event, "test", images, states, offline)
+                self.assertEqual(offline.call_count, 2)
+            with mock.patch.object(hook.time, "time", return_value=140):
+                result = hook.handle_session_event(event, "test", images, states, lambda _: PNG)
+                self.assertIn("view_image", result["hookSpecificOutput"]["additionalContext"])
+                with self.assertRaises(hook.BridgeUnavailable):
+                    hook.handle_session_event(event, "test", images, states, offline)
+            with self.assertRaises(hook.BridgeUnavailable):
+                hook.handle_session_event(dict(event, session_id="session-two"), "test", images, states, offline)
 
     def test_merge_preserves_other_hooks_and_is_idempotent(self):
         existing = {"hooks": {"Stop": [{"hooks": [{"command": "other"}]}],
@@ -112,6 +134,15 @@ class HookTests(unittest.TestCase):
         self.assertEqual(merged["hooks"]["UserPromptSubmit"][0],
                          existing["hooks"]["UserPromptSubmit"][0])
         self.assertEqual(hook.merge_hooks(copy.deepcopy(merged), "python hook.py"), merged)
+
+    def test_interpreter_migration_removes_only_previous_managed_hook(self):
+        old = {"hooks": {"UserPromptSubmit": [{"hooks": [
+            {"command": "/old/python /home/user/.codex/clipaste/clipboard_hook.py run"},
+            {"command": "validate-prompt"}]}]}}
+        result = hook.merge_hooks(old, "sh portable-launcher.sh",
+                                  Path("/home/user/.codex/clipaste/clipboard_hook.py"))
+        commands = [item["command"] for group in result["hooks"]["UserPromptSubmit"] for item in group["hooks"]]
+        self.assertEqual(commands, ["validate-prompt", "sh portable-launcher.sh"])
 
     @unittest.skipIf(os.name == "nt", "installer targets the Unix remote")
     def test_install_backup_reinstall_and_invalid_config(self):

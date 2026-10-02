@@ -13,19 +13,22 @@ This is a submit-time image workflow, not an attachment preview in the composer.
 The screenshot that is on the clipboard **when you submit** is the one used.
 Keep the screenshot on the clipboard while typing your prompt. Each marked
 submission gets its own immutable image file. Ordinary prompts never access
-the clipboard. A failed transfer or empty clipboard blocks the marked submission
-with a useful error. Codex must have its `view_image` tool available.
+the clipboard. An empty or damaged image blocks the marked submission. When the
+bridge is offline, the first marked request reports an error; subsequent requests
+in the same Codex session suppress duplicate hook errors and tell the model that
+no image was supplied. A 15-second cooldown avoids repeated connection attempts.
+Recovery resets the warning state. Codex must have `view_image` available.
 
 ## One-time remote setup
 
 Requires stock Codex with `UserPromptSubmit` hooks (verified target: 0.160.0),
-Python 3.9 or later, and the clipaste Windows daemon/tunnel. No Python packages
+Python 3.9 or later, uv, and the clipaste Windows daemon/tunnel. No Python packages
 are needed. On RHEL 8, use `python3.11` rather than the system Python 3.6.
 
 Copy `clipboard_hook.py` to the remote server and run:
 
 ```sh
-python3.11 clipboard_hook.py install
+uv run --offline --no-project --python 3.11 clipboard_hook.py install
 ```
 
 The installer copies the hook into `$CODEX_HOME/clipaste` (default `~/.codex/clipaste`)
@@ -56,29 +59,41 @@ Alternatively, point `-BinaryPath` to `clipaste.exe` downloaded from this fork's
 default; specify another Python 3.9+ executable if needed. After installation,
 review the hook once in Codex `/hooks`.
 
-For manual setup:
-
-Place `clipaste.exe` and `windows-bridge.ps1` in `%LOCALAPPDATA%\clipaste`, then run:
+After the first installation, use these commands in a new Windows shell:
 
 ```powershell
-pwsh.exe -NoProfile -WindowStyle Hidden -File "$env:LOCALAPPDATA\clipaste\windows-bridge.ps1" -HostAlias stssgoffmgt01-rh8
+clipaste-bridge add sgxmgt01-rh8
+clipaste-bridge status
+clipaste-bridge start
+clipaste-bridge stop
+clipaste-bridge remove sgxmgt01-rh8
 ```
 
-Create a Windows Startup shortcut with the same command for automatic login
-startup. The bridge keeps one SSH tunnel open, reconnects after disconnects,
-and starts/restarts the clipboard daemon in server-only mode. Existing Alacritty
-connections use it without reconnecting or changing their launch command. SSH
-must already authenticate non-interactively; normal host-key verification is
-retained. For other hosts, change the alias; this supervisor currently supports
-one configured remote host per Windows login.
+`add` installs the remote hook and registers an SSH alias without replacing other
+hosts. One Windows clipboard daemon is shared by independent tunnels for all
+configured hosts. Each tunnel reconnects independently, with backoff up to 60
+seconds. Adding/removing a host hot-reloads the config and leaves other tunnels
+alone. Multiple Alacritty windows share their server's tunnel; keep using your
+normal `ssh HOST` commands. SSH must authenticate non-interactively, with normal
+host-key verification. Removing a host closes its tunnel but retains remote hook
+files and previously saved images. Each server needs the one-time hook review.
+
+The host list lives in `%LOCALAPPDATA%\clipaste\bridge-hosts.json`. The Startup
+shortcut launches the supervisor without a hostname. Old single-host launch
+commands and shortcuts are migrated without dropping their original host.
+Each distinct server can use remote port 18340; `add HOST -RemotePort 19340`
+selects a different port if needed. Do not configure two aliases for the same
+physical server/listen port. `status` reports SSH process state, not a remote
+health guarantee; setup also checks the remote HTTP endpoint.
 
 Do not also add the same `RemoteForward` through `clipaste ssh-setup` for this
 host. The supervisor owns the port so multiple Alacritty windows can share it.
 Its endpoint is accessible to processes on the remote machine, as with upstream
 clipaste; use this with a trusted remote host. It never binds a public address.
 
-Logs are in `%LOCALAPPDATA%\clipaste\bridge.log` and `ssh.stderr.log`.
-To stop its tunnel, create `%LOCALAPPDATA%\clipaste\bridge.stop`. Remove the
+Logs are in `%LOCALAPPDATA%\clipaste\bridge.log` and per-host `ssh-*.stderr.log`
+files (the exact path appears in `status`). To stop all tunnels, run
+`clipaste-bridge stop`. Remove the
 Startup shortcut to disable login startup. The clipboard daemon is left running
 for other consumers. To remove the Codex integration, remove its one hook entry
 from `hooks.json` and the `clipaste` subdirectory; leave other hook entries intact.
@@ -90,15 +105,26 @@ Delete unwanted images there when no longer needed.
 Claude Code's existing clipboard-helper workflow remains available; the daemon
 and tunnel can be shared. This feature itself installs only a Codex hook.
 
+## Portable Codex settings
+
+Keep the portable launcher and hook registration in your Codex settings repo,
+while this fork remains the source of the hook runtime. Host endpoints, images,
+warning state, and trust hashes belong outside Git. A settings installer may
+write its reviewed launcher command to `$CODEX_HOME/clipaste/managed-command.txt`;
+clipaste's installer then preserves that command during runtime/endpoint updates.
+It also migrates old registrations of the same script when the Python path changes.
+
 ## Verification
 
 ```sh
-python3.11 -m unittest discover -s integrations/codex -v
+uv run --offline --no-project --python 3.11 python -m unittest discover -s integrations/codex -v
 ```
 
 Tests cover marker matching, no access for ordinary prompts, private snapshots,
 empty/error/oversized responses, PNG integrity, timeouts, loopback-only URLs,
-installer idempotency, existing-hook preservation, and the blocking exit code.
+installer idempotency, existing-hook preservation, outage suppression/recovery,
+and the blocking exit code. Run `test-bridge-config.ps1` for multi-host config
+updates, deduplication, and isolation tests.
 Also verify a real Windows clipboard image through the tunnel and a real Codex
 turn; unit tests do not establish end-to-end image understanding.
 
@@ -120,3 +146,6 @@ Verified on Windows -> `stssgoffmgt01-rh8` (RHEL 8, Python 3.11, stock Codex
 0.160.0): the model correctly identified the random code and orange circle;
 text copying cleared the staged screenshot; and terminating only the managed
 SSH tunnel caused the supervisor to reconnect and restore the endpoint.
+Multi-host verification additionally covered clipboard transfer to `sgxmgt01-rh8`,
+an unreachable third host, removal, and recovery of one tunnel without restarting
+the other. A subprocess test verified one warning per session while offline.
