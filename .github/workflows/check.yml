@@ -4,11 +4,21 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  codex-hook:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.9'
+      - run: python -m unittest discover -s integrations/codex -v
+
   test:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -19,6 +29,27 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --locked
       - run: cargo clippy --locked --all-targets
+      - name: Test multi-host bridge configuration
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./integrations/codex/test-bridge-config.ps1
+      - name: Build Windows bridge executable
+        if: runner.os == 'Windows'
+        run: cargo build --locked --release
+      - name: Build and test Windows desktop installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./integrations/windows/build.ps1
+      - uses: actions/upload-artifact@v7
+        if: runner.os == 'Windows'
+        with:
+          name: clipaste-windows-installer
+          path: target/desktop/installer/*.exe
+      - uses: actions/upload-artifact@v7
+        if: runner.os == 'Windows'
+        with:
+          name: clipaste-windows
+          path: target/release/clipaste.exe
 
   linux-desktop:
     runs-on: ubuntu-latest

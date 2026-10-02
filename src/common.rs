@@ -12,9 +12,10 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-pub const VERSION: &str = "2.6.0";
+pub const VERSION: &str = "2.6.1";
+pub const IMAGE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 pub const DEFAULT_PORT: u16 = 18340;
 
 pub fn supports_clipboard_host(os: &str) -> bool {
@@ -154,9 +155,7 @@ fn png_cache_name(bytes: &[u8]) -> String {
 
 /// Save PNG bytes at a stable, content-addressed path, reusing identical bytes.
 ///
-/// Published paths (including legacy timestamp paths) are retained until the
-/// user explicitly deletes them: clipboard histories can reference them long
-/// after the daemon exits. Disk usage therefore grows with unique images.
+/// Published paths expire after 24 hours, including paths referenced by old turns.
 /// A conflicting/corrupt cache entry is never replaced;
 /// saving fails and logs an error so its owner can inspect or explicitly delete it.
 pub fn save_png_to_temp(png_data: &[u8]) -> Option<PathBuf> {
@@ -315,11 +314,59 @@ fn save_png_in_dir(dir: &Path, png_data: &[u8]) -> io::Result<PathBuf> {
     Ok(path)
 }
 
-/// Kept for existing callers. Published PNGs have no automatic expiry because
-/// external clipboard histories retain their paths. Remove them explicitly to
-/// reclaim disk space; interrupted staging files may also be removed manually.
-#[cfg(any(target_os = "macos", target_os = "windows", test))]
-pub fn clean_old_temp_files() {}
+/// Only known cache filenames are eligible; never traverse directories or symlinks.
+fn is_snapshot_name(name: &str) -> bool {
+    let Some(stem) = name.strip_prefix("shot-").and_then(|n| n.strip_suffix(".png")) else {
+        return false;
+    };
+    if let Some(hash) = stem.strip_prefix("sha256-") {
+        return hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+}
+
+pub fn cleanup_images_in_dir(dir: &Path, now: SystemTime) -> io::Result<usize> {
+    match fs::symlink_metadata(dir) {
+        Ok(info) if !info.file_type().is_dir() => return Err(io::Error::other("PNG cache must be a real directory")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+        _ => {}
+    }
+    let mut removed = 0;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if !is_snapshot_name(&entry.file_name().to_string_lossy()) { continue; }
+        let info = fs::symlink_metadata(entry.path())?;
+        if !info.file_type().is_file() { continue; }
+        if now.duration_since(info.modified()?).unwrap_or_default() >= IMAGE_RETENTION {
+            match fs::remove_file(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {},
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(removed)
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn clean_old_temp_files() {
+    if let Err(e) = cleanup_images_in_dir(&temp_dir(), SystemTime::now()) {
+        log(&format!("snapshot cleanup failed: {e}"));
+    }
+}
+
+pub fn start_cache_cleanup(latest: LatestImage) {
+    std::thread::spawn(move || loop {
+        if let Err(e) = cleanup_images_in_dir(&temp_dir(), SystemTime::now()) {
+            log(&format!("snapshot cleanup failed: {e}"));
+        }
+        if let Ok(mut guard) = latest.lock() {
+            if guard.as_ref().is_some_and(|path| !path.exists()) { *guard = None; }
+        }
+        std::thread::sleep(Duration::from_secs(60));
+    });
+}
 
 /// Convert TIFF bytes to PNG bytes
 #[cfg(target_os = "macos")]
@@ -678,11 +725,13 @@ mod cache_tests {
     }
 
     #[test]
-    fn cleanup_retains_published_and_legacy_paths() {
+    fn cleanup_expires_only_owned_snapshot_names_after_24_hours() {
         let dir = TestDir::new();
         let current = save_png_in_dir(&dir.0, &png(1)).unwrap();
-        let legacy = dir.0.join("shot-old-timestamp.png");
+        let legacy = dir.0.join("shot-1700000000.png");
         fs::write(&legacy, png(2)).unwrap();
+        let unrelated = dir.0.join("other.png");
+        fs::write(&unrelated, png(3)).unwrap();
         for path in [&current, &legacy] {
             fs::File::options()
                 .write(true)
@@ -695,10 +744,21 @@ mod cache_tests {
                 )
                 .unwrap();
         }
-        // This compatibility hook is intentionally a no-op and reads no HOME.
-        clean_old_temp_files();
-        assert_eq!(fs::read(current).unwrap(), png(1));
-        assert_eq!(fs::read(legacy).unwrap(), png(2));
+        assert_eq!(cleanup_images_in_dir(&dir.0, SystemTime::UNIX_EPOCH + IMAGE_RETENTION - Duration::from_secs(1)).unwrap(), 0);
+        assert_eq!(cleanup_images_in_dir(&dir.0, SystemTime::UNIX_EPOCH + IMAGE_RETENTION).unwrap(), 2);
+        assert!(!current.exists());
+        assert!(!legacy.exists());
+        assert!(unrelated.exists());
+        let fresh = save_png_in_dir(&dir.0, &png(4)).unwrap();
+        assert_eq!(cleanup_images_in_dir(&dir.0, SystemTime::now()).unwrap(), 0);
+        assert!(fresh.exists());
+        #[cfg(unix)] {
+            let link = dir.0.join("shot-123.png");
+            std::os::unix::fs::symlink(&unrelated, &link).unwrap();
+            cleanup_images_in_dir(&dir.0, SystemTime::now() + IMAGE_RETENTION).unwrap();
+            assert!(link.is_symlink());
+            assert!(unrelated.exists());
+        }
     }
 
     #[cfg(unix)]

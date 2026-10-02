@@ -88,6 +88,7 @@ fn main() {
         eprintln!("clipaste: cannot start HTTP server: {e}");
         std::process::exit(1);
     }
+    common::start_cache_cleanup(latest.clone());
 
     // Start clipboard watcher (platform-specific)
     #[cfg(target_os = "macos")]
